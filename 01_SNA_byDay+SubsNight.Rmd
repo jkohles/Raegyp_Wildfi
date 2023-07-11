@@ -1,0 +1,523 @@
+---
+title: "Rousettus aegyptiacus Social Network Analysis"
+author: "Jenna Kohles"
+date: "2023-06-19"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+### Packages ###
+
+library(move)
+library(data.table)
+library(scales)
+library(tidyr)
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(cowplot)
+library(photobiology) #for calculating sunrise
+library(stringr) #for replacing Day27 with Day1 etc.
+library(pbapply) #progress bar for running slow code
+
+```
+
+Load proximity data formatted into a list of matrices per 5-min timestamp (created in my Rscript GPSvsProx_Validation_withRecSenMatricestoDF_withfinaldataset.R).
+
+```{r}
+
+load(file = "/Users/jennakohles/ownCloud/Documents 2/Dechmann Lab/Rousettus Cyprus/Analyses/GPSvsProx/matrix_chunks/proxiMat_timeLs_withNBgateways.rda")
+
+```
+
+## Task 1. Create average of RSSI values per day and per night.
+
+  * Step 1  Separate timestamps into Day1, Night1, Day2, Night2, etc.
+  
+  * Step 2  Average RSSI values per Day 1, Night1, Day2, Night2, etc.
+  
+  * Step 3  Run Mantel tests comparing Day1-Night1, Day2-Night2, etc. 
+
+### Step 1
+```{r}
+
+##########
+#Step 1
+##########
+
+### Turn proxiMat_timeLs into a dataframe
+proxiMat_df <- do.call(rbind.data.frame, proxiMat_timeLs) 
+
+### Get time periods outside of the roost from GPS data trackids
+setwd("/Users/jennakohles/ownCloud/Documents 2/Dechmann Lab/Rousettus Cyprus/Analyses/Segmentation/")
+# Read in GPS data
+gps.embc <- readRDS(file="/Users/jennakohles/ownCloud/Documents 2/Dechmann Lab/Rousettus Cyprus/Analyses/Segmentation/combined_df_embcClass.rds")
+# Convert timestamps to POSIXct
+gps.embc <- gps.embc %>% 
+  mutate(timestamp = as.POSIXct(utcDate, format="%d.%m.%y %H:%M:%S", tz="UTC")) %>% 
+  mutate(timestamp_tz = format(timestamp, tz = "Asia/Nicosia")) %>% 
+  mutate(timestamp_tz = as.POSIXct(timestamp_tz, format="%Y-%m-%d %H:%M:%S", tz="Asia/Nicosia"))
+# Add coordinates in UTM
+gps.embc.sp <- SpatialPoints(cbind(gps.embc$lon, gps.embc$lat), proj4string = CRS("+init=epsg:4326 +proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0"))
+gps.embc.utm <- spTransform(gps.embc.sp, CRS("+proj=utm +zone=36 +ellps=WGS84 +datum=WGS84 +units=m +no_defs")) 
+utmcoords <- as.data.frame(gps.embc.utm@coords)
+gps.embc <- gps.embc %>% 
+  mutate(x = utmcoords$coords.x1) %>% 
+  mutate(y = utmcoords$coords.x2) 
+gps.embc_withtrackids <- gps.embc %>%
+  mutate(hour = hour(timestamp_tz)) %>% 
+  mutate(period = if_else(hour < 7, date(timestamp_tz) - days(1), date(timestamp_tz))) %>% 
+  mutate(trackid = paste0(id, "_", dense_rank(period))) %>%
+  group_by(id, period) %>%
+  mutate(trackid = first(trackid)) %>%
+  ungroup() %>%
+  dplyr::select(-c(hour, period)) %>% 
+  #add T to start of each batid
+  mutate(batid = paste("T", id, sep = ""))
+# Prepare to be joined with proxi data
+gps.forDayvNight <- gps.embc_withtrackids %>%
+  dplyr::select(flightClass_smooth, timestamp_tz, trackid, batid) %>% 
+  mutate(timestamp_tz_floor = floor_date(timestamp_tz, "minute")) %>% 
+  mutate(batid_time = paste(batid, timestamp_tz_floor, sep = "_")) 
+ggplot(gps.forDayvNight, aes(x=timestamp_tz_floor, y = batid)) +
+  geom_point(size = .5, stat = "identity", alpha = .75) +
+  labs(x = "Time") + 
+  theme_cowplot() +
+  theme(axis.text.y = element_text(size = 5))
+
+### Designate 'foraging' (outside of the cave) rows by those that are in the gps.embc_withtrackids dataframe by timestamp_tz
+# Proxi data for all timestamps regardless of whether another bat was in rangee
+proxiMat_df2 <- proxiMat_df %>% 
+  #set timestamps to Cyprus time (EET outside of daylight savings period)
+    with_tz(time, tz="EET") %>% 
+    mutate(batid_time = paste(Receiver, time, sep = "_")) %>% 
+    dplyr::select(batid_time, everything()) #%>%
+    # #filter for the gateway  
+    # filter(Receiver == "T5FE8") #%>% 
+    # #gives proxi data for which there is a signal received from at least one other individual
+    # filter(!apply(.[,-c(1:3)], 1, function(x) all(is.na(x))))
+    # dplyr::rename(batid = Receiver) %>% 
+    # dplyr::rename(timestamp_tz = time)
+
+# # Joins all proxi data with gps data that matches (most proxi data rows remain as NAs for the gps dataframe columns)
+# proxiMat_df3 <- dplyr::left_join(proxiMat_df2, gps.forDayvNight, by = "batid_time") %>% 
+#   dplyr::select("flightClass_smooth","timestamp_tz_floor","trackid","batid","batid_time",everything()) 
+# # The problem with this is that often GPS stopped collecting data before proximity sensor stopped collecting data
+
+### Instead try subsetting by proximity to one of the cave gateways
+proxiMat_df3 <- proxiMat_df2 %>% 
+  #label rows where tag has NA values for all cave gateways as 'foraging'
+  mutate(InsideorOutsideCave = ifelse((!is.na(T5FE8) | !is.na(TF854) | !is.na(TE444) | !is.na(T2BF0) | !is.na(TF57C) | !is.na(T5F48) | !is.na(TE39C) | !is.na(TF6A8) | !is.na(TE4C0) | !is.na(TF630)), "cave", "forage")) %>% 
+  dplyr::select(InsideorOutsideCave, Receiver, time, T5FE8, TF854, TE444, T2BF0, TF57C, T5F48, TE39C, TF6A8, TE4C0, TF630, everything()) #%>% 
+  #filter(Receiver == "TFFD4" )
+#plot  
+p <- ggplot(proxiMat_df3 %>% filter(InsideorOutsideCave == "cave"), aes(x=time, y = Receiver)) +
+    geom_point(size = .5, stat = "identity", alpha = .5) +
+    labs(x = "Time") + 
+    theme_cowplot() +
+    theme(axis.text.y = element_text(size = 5))
+p
+### Add GPS data to see how this compares to cave category
+p + geom_point(data = gps.forDayvNight, aes(x = timestamp_tz_floor, y = batid), color = "red", alpha = .1, size = .5)
+#Seems to divide data accurately
+
+
+### Subset just for individuals that have some "cave" values after the first night
+proxiMat_df4 <- proxiMat_df3 %>%
+  #filter for time beginning with the first roosting day after capture but not before
+  filter(!time < as.POSIXct("2023-01-27 06:00:00", tz = "EET")) %>% 
+  group_by(Receiver) %>%
+  #filter for bats that spent time in the cave after the first whole night and day after capture
+  filter(any(InsideorOutsideCave == "cave" & time > as.POSIXct("2023-01-28 06:00:00", tz = "EET"))) %>% 
+  mutate(runlengths = rep(rle(InsideorOutsideCave)$lengths, rle(InsideorOutsideCave)$lengths)) %>% 
+  dplyr::select(runlengths, everything()) #%>% 
+  #filter(any(InsideorOutsideCave == "cave" & runlengths > 120)) #%>% 
+  #filter(Receiver == "TFED0")
+#plot  
+p2 <- ggplot(proxiMat_df4 %>% filter(InsideorOutsideCave == "cave"), aes(x=time, y = Receiver)) +
+    geom_point(size = .5, stat = "identity", alpha = .5) +
+    labs(x = "Time") + 
+    theme_cowplot() +
+    theme(axis.text.y = element_text(size = 5))
+p2
+# Number of bats pre batsubset
+unique(proxiMat_df2$Receiver)
+#109 - 10 non-bat tags = 99
+batsubset <- unique(proxiMat_df4$Receiver)
+#down to 70
+# Again with GPS data
+p2 + geom_point(data = gps.forDayvNight %>% filter(batid %in% batsubset), aes(x = timestamp_tz_floor, y = batid), color = "red", alpha = .1, size = .5)
+
+```
+
+Many bats seemed to roost somewhere other than our cave on the first day after capture but came back to roost on the 28th. Maybe for networks exclude this first day.
+
+```{r}
+
+### Now create Day1, Night1, Day2, Night2 IDs
+# Calculate min and max run lengths of inside and outside roost per individual
+runlengthsSummary <- proxiMat_df4 %>% 
+  group_by(Receiver, InsideorOutsideCave) %>% 
+  summarize(min = min(runlengths), max = max(runlengths)) %>% 
+  pivot_longer(cols = c(min, max), names_to = "statistic", values_to = "value") %>% 
+  mutate(statistic2 = paste(InsideorOutsideCave, statistic, sep = "."))
+# Plot as histogram
+ggplot(runlengthsSummary, aes(x=value, fill=statistic2)) + 
+  geom_histogram(position = "dodge", binwidth = 50) +
+  scale_x_continuous(breaks = seq(0, 3000, 50)) +
+  theme_cowplot() +
+  ylab("Count") +
+  xlab("# of fixes (5 min)") +
+  ggtitle("Duration of Behavior + Location") +
+  theme(axis.text.x = element_text(angle = 90, hjust=.5, vjust=.5))
+# Plot all runlength values as histogram
+# First filter for distinct rows so long runlengths aren't over represented
+proxiMat_df4_histogram <- proxiMat_df4 %>% dplyr::select(c(Receiver, InsideorOutsideCave, runlengths, time)) %>%
+  mutate(date = date(time)) %>% 
+  dplyr::select(-time) %>% 
+  distinct() %>% 
+  group_by(Receiver) %>% 
+  filter(!(runlengths == lag(runlengths) & date == lag(date, default = first(date)) + 1)) 
+#miiight filter a few we don't want, but chances are small that a period inside or outside the cave would be the exact same number of fixes on the same day for an individual
+ggplot(proxiMat_df4_histogram, aes(x=runlengths, fill=InsideorOutsideCave)) +
+  geom_histogram(position = "dodge", binwidth = 25) +
+  scale_x_continuous(breaks = seq(0, 3000, 50)) +
+  theme_cowplot() +
+  ylab("Count") +
+  xlab("# of fixes (5 min)") +
+  ggtitle("Duration of Behavior + Location") +
+  theme(axis.text.x = element_text(angle = 90, hjust=.5, vjust=.5))
+
+### Vast majority of cave periods are between 200 (16.5 hrs) and 250 (21 hrs) fixes 
+
+# Plot all runlength values as histogram with a cut-off of 400 fixes (probably instances of tags fallen off bats)
+ggplot(proxiMat_df4_histogram %>% filter(runlengths < 400), aes(x=runlengths, fill=InsideorOutsideCave)) + 
+  geom_histogram(position = "dodge", binwidth = 2) +
+  scale_x_continuous(breaks = seq(0, 400, 10)) +
+  theme_cowplot() +
+  ylab("Count") +
+  xlab("# of fixes (5 min)") +
+  ggtitle("Duration of Behavior + Location") +
+  theme(axis.text.x = element_text(angle = 90, hjust=.5, vjust=.5))
+# Looking for a cut-off point for small insignificant forays outside of the roost
+# Probably can ignore the periods in that first 2-fix/10min bin? Because there are so many, probably just error?  
+
+```
+
+Try to separate days during in the morning return to the roost
+
+When bats come back to the roost for "good" in the morning, hard to do via time, but probably could look at sunrise as a cut-off, and then smooth by then the period that includes a time well past sunrise...
+
+```{r}
+
+# calculate sunrise 
+my.geocode <- data.frame(lat = 34.8704, lon = 32.3500) #Main cave in Paphos, Cyrus
+# create new column with sunset time for each date
+proxiMat_df4 <- proxiMat_df4 %>%
+  ungroup() %>% 
+  mutate(sunrise.time = sunrise_time(ymd(format(time, "%Y-%m-%d")), tz = "Asia/Nicosia", geocode = my.geocode)) %>%
+  dplyr::select(sunrise.time, everything())
+  # If I want to calculate time before or after sunrise
+  #mutate(timeSinceSunset = as.numeric(difftime(as.POSIXct(mtime2), as.POSIXct(sunset.time), tz = "America/Panama", units = "mins")))
+
+# The previous histogram but just periods between midnight and 12pm 
+# First filter for distinct rows so long runlengths aren't over represented
+proxiMat_df4_histogram2 <- proxiMat_df4 %>% dplyr::select(c(Receiver, InsideorOutsideCave, runlengths, time, sunrise.time)) %>%
+  filter(time < sunrise.time + hours(1)) %>% 
+  mutate(date = date(time)) %>% 
+  dplyr::select(-c(time, sunrise.time)) %>% 
+  distinct() %>% 
+  group_by(Receiver) %>% 
+  filter(!(runlengths == lag(runlengths) & date == lag(date, default = first(date)) + 1)) 
+#miiight filter a few we don't want, but chances are small that a period inside or outside the cave would be the exact same number of fixes on the same day for an individual
+ggplot(proxiMat_df4_histogram2 %>% filter(runlengths < 400), aes(x=runlengths, fill=InsideorOutsideCave)) + 
+  geom_histogram(position = "dodge", binwidth = 2) +
+  scale_x_continuous(breaks = seq(0, 400, 10)) +
+  theme_cowplot() +
+  ylab("Count") +
+  xlab("# of fixes (5 min)") +
+  ggtitle("Duration of Behavior + Location") +
+  theme(axis.text.x = element_text(angle = 90, hjust=.5, vjust=.5))
+
+proxiMat_df5 <- proxiMat_df4 %>% 
+  group_by(Receiver) %>% 
+  mutate(runlength.sequence.id = cumsum(c(1, diff(as.numeric(runlengths)) != 0))) %>% 
+  group_by(Receiver, runlength.sequence.id) %>% 
+  mutate(trackingDayNight = 
+          ifelse(any(last(InsideorOutsideCave) == "cave" & last(time) >= sunrise.time + hours(2)), paste("Day", day(time), sep = ""),
+            ifelse(any(last(InsideorOutsideCave) == "cave" & last(time) <= sunrise.time + hours(2)), paste("Day", day(time)-1, sep = ""),
+              ifelse((InsideorOutsideCave == "forage" & format(time, "%H:%M") < "23:59" & format(time, "%H:%M") > "16:00"), paste("Night", day(time), sep = ""),
+                ifelse((InsideorOutsideCave == "forage" & format(time, "%H:%M") > "00:00" & time < sunrise.time + hours(2)), paste("Night", day(time)-1, sep = ""), NA))))) %>%
+  dplyr::select(trackingDayNight, runlength.sequence.id, everything())
+# Works!
+# Now to change the Day/Night ID from the date to the sequence of tracking days
+trackingdays <- c(26, day(unique(date(proxiMat_df5$time))))
+proxiMat_df6 <- proxiMat_df5 %>% 
+  ungroup() %>% 
+  #filter(!is.na(trackingDayNight)) %>% 
+  mutate(trackDayIndex = str_extract(trackingDayNight, "\\d+")) %>% 
+  mutate(trackDayIndex = match(trackDayIndex, trackingdays)) %>% 
+  mutate(trackingDayNight = str_replace(trackingDayNight, "\\d+", as.character(trackDayIndex))) %>% 
+  dplyr::select(trackDayIndex, everything())
+#plot  
+ggplot(proxiMat_df6, aes(x=time, y = Receiver, color = trackingDayNight)) +
+    geom_point(size = .5, stat = "identity", alpha = .5) +
+    #scale_color_manual(labels = c("Day","Night"), values = c("black", "gray")) +
+    labs(x = "Time") + 
+    theme_cowplot() +
+    theme(axis.text.y = element_text(size = 5), legend.position = "none")  
+
+```
+
+Previous attempts at separating days across bats
+```{r}
+
+# proxiMat_df5 <- proxiMat_df4 %>%
+#   group_by(Receiver) %>%
+#   # For each date of time
+#   mutate(date = as.Date(time)) %>%
+#   group_by(Receiver, date) %>%
+#   # Select rows grouped by runglength.sequence.id with maximum value for runlengths
+#   slice_max(runlengths) %>%
+#   # Give new value in DayNightID
+#   mutate(DayNightID = case_when(
+#     hour(time) >= 4 & hour(time) < 21 & InsideorOutsideCave == "insideCave" ~ paste0("Day", format(date, "%d")),
+#     hour(time) >= 18 | hour(time) < 6 & InsideorOutsideCave == "outsideCave" ~ paste0("Night", format(date[1], "%d"))
+#     )) %>% 
+#   dplyr::select(DayNightID, everything())
+# #plot  
+# ggplot(proxiMat_df5, aes(x=time, y = Receiver, color = DayNightID)) +
+#     geom_point(size = .5, stat = "identity", alpha = .5) +
+#     #scale_color_manual(labels = c("Day","Night"), values = c("black", "gray")) +
+#     labs(x = "Time") + 
+#     theme_cowplot() +
+#     theme(axis.text.y = element_text(size = 5), legend.position = "none")  
+#   
+#   
+# 
+#   mutate(hour = hour(time)) %>%
+#   mutate(DayNight = ifelse(InsideorOutsideCave == "insideCave", "Day", "Night")) %>% 
+#   mutate(DayNightID = ifelse((hour<24 & hour>4 & DayNight == "Day"), paste(DayNight, day(time), sep = "_"),
+#                              ifelse(hour>24 & DayNight == "Night", paste(DayNight, (day(time)-1), sep = "_"), NA))) %>% 
+#     dplyr::select(DayNightID, DayNight, everything())
+# #NEED TO DO THE CODE ABOVE BUT ONLY FOR NIGHT BECAUSE ITS THIS THAT SPANS 2 DAYS
+# 
+# #plot  
+# ggplot(proxiMat_df5, aes(x=time, y = Receiver, color = DayNightID)) +
+#     geom_point(size = .5, stat = "identity", alpha = .5) +
+#     #scale_color_manual(labels = c("Day","Night"), values = c("black", "gray")) +
+#     labs(x = "Time") + 
+#     theme_cowplot() +
+#     theme(axis.text.y = element_text(size = 5), legend.position = "none")
+# 
+# 
+# 
+# mutate(runlength.sequence.id = cumsum(c(1, diff(as.numeric(runlengths)) != 0))) %>% 
+#   mutate(timeOnly = format(as.POSIXct(time), format = "%H:%M:%S")) %>%
+# 
+#   mutate(InsideorOutsideCave.num = as.numeric(as.factor(InsideorOutsideCave))) %>%
+#   mutate(InsideorOutsideCave.smooth = ifelse(runlengths < 100, 
+#                                              ifelse(InsideorOutsideCave.num == lag(InsideorOutsideCave.num), lag(InsideorOutsideCave.num, n = sum(InsideorOutsideCave.num == lag(InsideorOutsideCave.num), na.rm = TRUE)), lag(InsideorOutsideCave.num)), InsideorOutsideCave.num)) %>% 
+#   group_by(Receiver, runlength.sequence.id) %>% 
+#   mutate(InsideorOutsideCave.smooth = first(InsideorOutsideCave.smooth)) %>% 
+#   ungroup() %>% 
+#   dplyr::select(InsideorOutsideCave.smooth, InsideorOutsideCave.num, runlength.sequence.id, everything())
+#   
+# 
+#   mutate(DayNightID = ifelse((InsideorOutsideCave == "insideCave") & 
+#                                (runlengths > 150 ) & #& runlengths < 250
+#                                (hour > 1 & hour < 22), 
+#                              paste("Day"),
+#                              paste("Night"))) %>% 
+#   dplyr::select(DayNightID, hour, runlength.sequence.id, timeOnly, everything())
+# #plot  
+# ggplot(proxiMat_df5, aes(x=time, y = Receiver, color = InsideorOutsideCave.smooth)) +
+#     geom_point(size = .5, stat = "identity", alpha = .5) +
+#     #scale_color_manual(labels = c("Day","Night"), values = c("black", "gray")) +
+#     labs(x = "Time") + 
+#     theme_cowplot() +
+#     theme(axis.text.y = element_text(size = 5), legend.position = "none")
+# 
+# #rep(rle(runlengths)$lengths, rle(runlengths)$lengths)) %>% 
+#   
+#   mutate(hour = hour(timestamp_tz)) %>%  
+#   mutate(period = if_else(hour < 7, date(timestamp_tz) - days(1), date(timestamp_tz))) %>% 
+#   mutate(trackid = paste0(id, "_", dense_rank(period))) %>%
+#   group_by(id, period) %>%
+#   mutate(trackid = first(trackid)) %>%
+#   ungroup() %>%
+#   dplyr::select(-c(hour, period))
+
+```
+
+
+#### 6. Calculate edge weights based on relative proximity RSSI values
+
+A symmetrical weighted network ("a numeric value describing the strength of the relationship or the number of interactions") -- averaged RSSI values for each pair at each timestamp
+
+If we calculate networks for strength of proximity cave vs. forage, how do we deal with instances where one bat is inside the cave while the other is outside? These timestamps are not included in the calculation or they are automatic zeros? I think it has to be the former because otherwise we cannot calculate two separate networks. So then "the number of observations (or total time) differs between individuals... [and] the relationship should reflect the rates at which interactions occurred (dividing by observation time, see Farine 2015)". 
+
+Calculate Eab (from Farine and Whitehead 2015) per day of roosting in cave
+
+x / x + Yab + Ya + Yb
+
+x: the summed value of RSSI for each pair of bats while 'cave' (in this formula typically this would be a count of the number of associations)
+Yab: a count of the number of timestamps that both individuals in a pair of bats were both 'cave' but not in proximity (RSSI=NA)
+Ya: a count of the total number of timestamps that individual a was 'cave' when b was not 'cave'
+Yb: a count of the total number of timestamps that indivdiual b was 'cave' when a was not 'cave'
+
+And do the same but for when backs are outside of the cave (forage)
+
+```{r, message = FALSE, warning = FALSE, tidy = TRUE}
+
+# turn proxiMat_df6 from wide to long format (columns of other bats become a single column of 'other.bat' and timestamps are repeated per individual to the number of other bats)
+proxiMat_df6_long <- proxiMat_df6 %>% 
+  pivot_longer(cols = 20:118, names_to = "other.bat", values_to = "RSSI.value") %>% 
+  dplyr::rename(R.InOut = InsideorOutsideCave) %>% 
+  filter(other.bat %in% unique(proxiMat_df6$Receiver))
+
+# Split into a list by each timestamp
+proxiMat_df6_long_L <- split(proxiMat_df6_long, proxiMat_df6_long$time)
+
+# Create a new variable OB.InOut to say whether the other.bat paired with each Receiver bat was in the cave or foraging for the timestamp of that row
+proxiMat_df6_long2 <- rbindlist(lapply(1:length(proxiMat_df6_long_L), function(x){
+  #x=11
+  df <- as.data.frame(proxiMat_df6_long_L[[x]])
+  RsInCave <- unique(pull(df %>% filter(R.InOut == "cave"), Receiver))
+  
+  df2 <- df %>% #by changing the name of the dataframe rather than just writing over it, I got what I was looking for
+  mutate(OB.InOut = ifelse(other.bat %in% RsInCave, "cave",
+                      ifelse(!other.bat %in% RsInCave, "forage", "neverReceiver")))
+
+  return(df2)
+}))
+  
+# Inside cave values
+proxi6_summ_cave <- proxiMat_df6_long2 %>%
+  group_by(Receiver, other.bat) %>% 
+  summarize(cave.Yab = sum(R.InOut == "cave" & OB.InOut == "cave" & is.na(RSSI.value)), cave.Ya = sum(R.InOut == "cave" & OB.InOut != "cave"), cave.Yb = sum(R.InOut != "cave" & OB.InOut == "cave"))
+proxi6_summ_cave2 <- proxiMat_df6_long2 %>% 
+  group_by(Receiver, other.bat) %>% 
+  summarize(cave.x = sum(!is.na(RSSI.value)))
+  #add_count(Receiver, other.bat, wt=time(!is.na(RSSI.value)), name="cave.x") #sums all the RSSi values for all non-NA values  
+proxi6_summ_cave3 <- cbind(proxi6_summ_cave, proxi6_summ_cave2[,"cave.x"]) %>% 
+  mutate(edgeweight = (cave.x/(cave.x+cave.Yab+cave.Ya+cave.Yb)))
+ggplot(proxi6_summ_cave3 %>% filter(Receiver == "TF8A0"), aes(x = reorder(other.bat, edgeweight, max), y = edgeweight, col = other.bat)) +
+  geom_bar(stat = "identity") +
+  theme_cowplot() +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 90, hjust=.5, vjust=.5))
+
+# Forage/outside cave values
+proxi6_summ_forage <- proxiMat_df6_long2 %>%
+  group_by(Receiver, other.bat) %>% 
+  summarize(forage.Yab = sum(R.InOut == "forage" & OB.InOut == "forage" & is.na(RSSI.value)), forage.Ya = sum(R.InOut == "forage" & OB.InOut != "forage"), forage.Yb = sum(R.InOut != "forage" & OB.InOut == "forage"))
+proxi6_summ_forage2 <- proxiMat_df6_long2 %>% 
+  group_by(Receiver, other.bat) %>% 
+  summarize(forage.x = sum(!is.na(RSSI.value)))
+  #add_count(Receiver, other.bat, wt=time(!is.na(RSSI.value)), name="forage.x") #sums all the RSSi values for all non-NA values  
+proxi6_summ_forage3 <- cbind(proxi6_summ_forage, proxi6_summ_forage2[,"forage.x"]) %>% 
+    mutate(edgeweight = (forage.x/(forage.x+forage.Yab+forage.Ya+forage.Yb)))
+ggplot(proxi6_summ_forage3 %>% filter(Receiver == "TF8A0"), aes(x = reorder(other.bat, edgeweight, max), y = edgeweight, col = other.bat)) +
+  geom_bar(stat = "identity") +
+  theme_cowplot() +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 90, hjust=.5, vjust=.5))
+
+# additional confirmation that this is doing what I want -- way fewer times when both bats are in the cave but not in proximity than when both bats are out of the cave and not in proximity; and the other two values are reciprocal between both dataframes
+
+```
+
+#### 7. Create associations matrix based on edge weight calculated in previous chunk
+
+Strength: the sum all edge values of the node; how many connections/associations does an individual have overall? 
+Degree: the number of first level connections; how many other individuals in the network is the individual connected to?
+Eigenvector Centrality: the centrality of an individual is based not only on their connections, but also based on the centrality of
+that individuals connections; how many friends do your friends have? 
+
+```{r}
+m <- proxi6_summ_cave3 %>% 
+  dplyr::select(c("Receiver","other.bat","edgeweight"))
+# put into matrix shape
+m.2 <- m %>%
+  pivot_wider(names_from = other.bat, values_from = edgeweight) 
+# create df of metadata 
+df <- m.2 %>% 
+  dplyr::select(Receiver) %>% 
+  rename(id = Receiver) %>% 
+  mutate(sex = paste("M"))
+Receiver <- m.2$Receiver
+m.2 <- m.2 %>% 
+  dplyr::select(-Receiver)
+# convert to matrix
+m.3 <- data.matrix(m.2)
+m.3 <- symMatrix(m.3[upper.tri(m.3, TRUE)], nrow=nrow(m.3), byrow=TRUE)
+m.3[is.na(m.3)] <- 0
+rownames(m.3) <- Receiver
+colnames(m.3) <- Receiver
+class(m.3) <- "numeric"
+# compute strength, degree, and eigenvector   
+df = met.strength(M=m.3, df=df, dfid = 1)
+df = met.degree(M=m.3, df=df, dfid=1)
+df = met.eigen(M=m.3, df=df, dfid=1)
+
+vis.net(m.3, df, id = 1,
+        size = "strength",
+        label = 1,
+        e.width = 25,
+        viewer = FALSE) 
+
+which.metric()
+
+```
+
+### 7. Try visualizing networks with visNetwork instead of NetExplorer because the latter is not working properly
+
+```{r}
+
+# My data
+edges.me <- proxi6_summ_cave3 %>%  
+  dplyr::select(c(Receiver,other.bat,edgeweight)) %>% 
+  rename(from = Receiver, to = other.bat, width = edgeweight) #%>% 
+  #mutate(width = width*50)
+
+nodes.me <- proxi6_summ_cave3 %>%  
+  dplyr::select(Receiver) %>% 
+  rename(id = Receiver) %>% 
+  mutate(label = id) %>% 
+  distinct()
+
+#Create graph for Louvain
+graph.me <- graph_from_data_frame(edges.me, directed = FALSE)
+
+#Louvain Comunity Detection
+cluster.me <- cluster_louvain(graph.me)
+
+cluster_df.me <- data.frame(as.list(membership(cluster.me)))
+cluster_df.me <- as.data.frame(t(cluster_df.me)) 
+cluster_df.me$label <- rownames(cluster_df.me)
+
+#Create group column
+nodes.me <- left_join(nodes.me, cluster_df.me, by = "label")
+colnames(nodes.me)[3] <- "group"
+
+visNetwork(nodes.me, edges.me,  width = "100%") %>% 
+  visIgraphLayout(layout = "layout_in_circle") %>% 
+  visNodes(
+    labelHighlightBold = TRUE, 
+    shape = "circle",
+    color = list(
+      background = "#0085AF",
+      border = "#013848",
+      highlight = "#FF8000"),
+    font = list(size = 26, color = "#A2142F")) %>% 
+  visEdges(
+    shadow = FALSE,
+    color = list(color = "#0085AF", highlight = "#C62F4B")) %>%
+  visOptions(highlightNearest = list(enabled = T, degree = 1, hover = T)) %>%
+    visLayout(randomSeed = 110)
+
+```
+
